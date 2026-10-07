@@ -1,0 +1,430 @@
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ @code
+  ___ _____ _   ___ _  _____ ___  ___  ___ ___
+ / __|_   _/_\ / __| |/ / __/ _ \| _ \/ __| __|
+ \__ \ | |/ _ \ (__| ' <| _| (_) |   / (__| _|
+ |___/ |_/_/ \_\___|_|\_\_| \___/|_|_\\___|___|
+ embedded.connectivity.solutions.==============
+ @endcode
+
+ @file
+ @copyright  STACKFORCE GmbH, Germany, www.stackforce.de
+ @author     STACKFORCE
+ @brief      Example main application for the Stack API.
+
+ @example    exampleMain.c
+             Example for the API usage of the stack.
+*/
+/* Standard libraries */
+#include <stdint.h>
+#include <stdbool.h>
+
+#include "exampleMain.h"
+#include "sf_app_hal_lp.h"
+#include "sf_app_hal_system.h"
+#include "sf_app_hal.h"
+#include "sf_app_hal_timer.h"
+#include "sf_stack.h"
+#include "sf_stack_nb.h"
+#include "sf_stack_app_ex.h"
+#include "sf_memory_management.h"
+#include "pvcMeasure/pvcMeasure.h"
+#include <ti/drivers/ADC.h>
+#include "lampStatusFinder/lampStatusFinder.h"
+#include <ti/drivers/GPIO.h>
+#include <syscfg/ti_drivers_config.h>
+#include"externalNvs/flash_interface.h"
+#include "memoryHandler/memoryHandle.h"
+
+
+#define MIN_VOLATGE   100
+#define MIN_BAT_TH   3000
+#define batteryLowSleepSec  3600
+#define BURNTIME_SAVE_CYCLES 900
+#define wakeUpTime 30//30
+
+uint8_t perodicStatus=false;
+
+#ifndef SF_STACK_NUMBER
+/*! The definitions SF_STACK_NUMBER is available in the CMakeLists.txt */
+#define SF_STACK_NUMBER                 0
+#endif
+
+#ifndef SF_STACK_LIST
+/*! The definitions SF_STACK_LIST is available in the CMakeLists.txt */
+#define SF_STACK_LIST                   { E_STACK_ID_NONE }
+#endif
+
+#ifndef SF_STACK_NB_ENABLED
+/*! The definition SF_STACK_NB_ENABLED is by default set to 0.
+    It defines, if a telegram should be send in a blocking or non blocking way. */
+#define SF_STACK_NB_ENABLED             0
+#endif
+
+/*! Flag that indicates, that a transmission is ready */
+static volatile bool gReadyToSend;
+/*! Variable that holds the rx length */
+static volatile uint16_t gRxDataLength;
+/*! Flag that indicates, that the stack data has changed. */
+static volatile bool gStackDataChanged = false;
+
+//===================amplifer_state=======================================
+/*============================================================================*/
+void poweramplierEnable() {
+  GPIO_write(CONFIG_CC1190_PA_EN_DIO3, 1);
+  GPIO_write(CONFIG_CC1190_LNA_EN_DIO4, 0);
+  GPIO_write(CONFIG_CC1190_HGM_DIO5, 1);
+
+}
+
+void poweramplierDisable() {
+  GPIO_write(CONFIG_CC1190_PA_EN_DIO3, 0);
+  GPIO_write(CONFIG_CC1190_LNA_EN_DIO4, 0);
+  GPIO_write(CONFIG_CC1190_HGM_DIO5, 0);
+}
+//=========================================================================
+
+/*============================================================================*/
+/*!
+ * @brief  Callback function definition of the stack. This function will be
+ *         passed to the stack initialization function as parameter. The stack
+ *         uses this callback to inform the application layer about event.
+ *
+ * @param  event    Defines the event which occurred.
+ * @param  data     A pointer to data. The pointer can be NULL, as not
+ *                  every event requires data.
+ * @param  dataLen  The length of the data. Can be zero.
+ *
+ * @return The return value shall be E_STACK_RETURN_SUCCESS.
+ */
+/*============================================================================*/
+static stackReturn_t loc_callback( stackEvent_t event, uint8_t *data,
+                                   uint16_t dataLen )
+{
+  /* Handle the events triggered by the Stack */
+  switch( event )
+  {
+    case E_STACK_EVENT_SLEEP:
+      /* Application sleep function without RAM loss. */
+      sf_app_hal_lp_enterSleep( );
+      break;
+
+    case E_STACK_EVENT_DEEP_SLEEP:
+      /* Application deep sleep function without RAM loss. */
+      sf_app_hal_lp_enterDeepSleep( );
+      break;
+
+    case E_STACK_EVENT_WAKEUP:
+      /* Application wakeup function. */
+      sf_app_hal_lp_wakeup();
+      break;
+
+    case E_STACK_EVENT_RX_SUCCESS:
+      /* Indication about a new received message. */
+      if( sizeof(gRxDataLength) == dataLen )
+      {
+        gRxDataLength = (data[1] | data[0] << 8);
+      }
+      break;
+
+    case E_STACK_EVENT_PERSISTENT_DATA_UPDATE:
+      /* Indication about updated nvm context. */
+      gStackDataChanged = true;
+      break;
+
+    default:
+      break;
+  }
+
+  return E_STACK_RETURN_SUCCESS;
+}
+
+/*============================================================================*/
+/*!
+ * @brief  Callback function definition of the timer. This callback function
+ *         sets a status to initiate another transmission.
+ *
+ * @param  pCtx    A pointer to a potential data context.
+ */
+/*============================================================================*/
+static void loc_timerCallback( void* pCtx )
+{
+  sf_app_hal_lp_wakeup();
+  gReadyToSend = true;
+}
+
+/*============================================================================*/
+/*!
+ * @brief  Function to transmit and receive data.
+ */
+/*============================================================================*/
+static void loc_sendData(uint8_t * publishData, uint16_t dataSize)
+{
+  stackReturn_t status = E_STACK_RETURN_ERROR;
+  poweramplierEnable();
+  #if ( 0 == SF_STACK_NB_ENABLED )
+  /* Send a frame in a blocking way. */
+  status = sf_stack_send(dataSize, publishData);
+  #elif ( 1 == SF_STACK_NB_ENABLED )
+  /* Send a frame in a non blocking way. */
+  status = sf_stack_nb_send( sizeof(sampleData), sampleData );
+  #endif
+  poweramplierDisable();
+  /* Error Handling. */
+  if( status == E_STACK_RETURN_ERROR )
+  {
+    /* Please note that if you use evaluation version the allowed
+        number of transmissions and payload size is limited.
+        Check the main page of the Documentation for more information.  */
+    sf_app_hal_system_errorHandler( );
+  }
+}
+
+/*============================================================================*/
+/*!
+ * @brief  Gets the next stack
+ *
+ * @return The next stack @ref stackId_t
+ */
+/*============================================================================*/
+static stackId_t loc_getNextStack( void )
+{
+  static uint8_t currentIndex = 0;
+  uint8_t stacks[] = SF_STACK_LIST;
+  stackId_t ret = E_STACK_ID_NONE;
+
+  ret = (stackId_t) stacks[currentIndex];
+
+  currentIndex++;
+
+  if( currentIndex >= SF_STACK_NUMBER )
+  {
+    currentIndex = 0;
+  }
+  return ret;
+}
+
+/*============================================================================*/
+/*!
+ * @brief  Handles multiprotocol transmissions.
+ */
+/*============================================================================*/
+static void loc_handleTransmission(serveTransmitPkt_t serveTransmitPkt)
+{
+  stackId_t currentStack = E_STACK_ID_NONE;
+
+  /* Check if the timer has expired. */
+
+    /* Reset flag. */
+  if (true == gReadyToSend) {
+      gReadyToSend=false;
+
+   if(serveTransmitPkt.pktType!=PKT_NONE){
+    /* Choose the stack for the upcoming transmission */
+    currentStack = loc_getNextStack( );
+
+    /* Select the stack and enable it */
+    if( E_STACK_RETURN_SUCCESS == sf_stack_selectStack( currentStack ) )
+    {
+      /* Transmit a frame. */
+
+      loc_sendData((uint8_t * ) & serveTransmitPkt, sizeof(serveTransmitPkt));
+    }
+   }
+  }
+
+
+}
+
+/*============================================================================*/
+/*!
+ * @brief  Handles the low power mode and process function.
+ */
+/*============================================================================*/
+static void loc_handleStackStates( void )
+{
+  uint8_t rxData[255] = { 0x00 };
+  stackState_t stackState = sf_stack_nb_isBusy();
+
+  if( stackState == E_STACK_STATE_IDLE )
+  {
+    /* Receive data, if available */
+    if( gRxDataLength > 0 )
+    {
+      sf_stack_receive( gRxDataLength, rxData );
+      gRxDataLength = 0;
+    }
+
+    /* Write stack data to NVM, if available.
+       Please note that the NVM write cycles are limited.
+       Please take care about the function sf_stack_app_mem_ex_writeNvm( ). */
+    if( true == gStackDataChanged )
+    {
+      sf_memory_management_writeNvm( );
+      gStackDataChanged = false;
+    }
+  }
+
+  if((E_STACK_STATE_BUSY_SLEEP == stackState) && (gReadyToSend == false))
+  {
+    sf_app_hal_lp_enterSleep( );
+  }
+  else if((stackState != E_STACK_STATE_BUSY_PROCESS) && (gReadyToSend == false))
+  {
+    sf_app_hal_lp_enterDeepSleep( );
+  }
+  sf_stack_nb_process( );
+}
+
+/*============================================================================*/
+/*!
+ * @brief  Main loop function.
+ *         It initializes the stack and transmits a frame continuously.
+ */
+/*============================================================================*/
+serveTransmitPkt_t lampStatus(){
+    serveTransmitPkt_t serveTransmitPkt;
+    pvc_t pvc;
+    memset(&serveTransmitPkt,0,sizeof(serveTransmitPkt));
+    memset(&pvc,0,sizeof(pvc));
+    pvc = pvc_measure(wakeUpTime*1000);
+    serveTransmitPkt = lampMonitor_isPacketSendRequired(pvc.voltage, pvc.power, pvc.batVolt, perodicStatus,MIN_POWER,MIN_VOLATGE,MIN_BAT_TH);
+    serveTransmitPkt.utc = 0;//getUtcTimeWaitForSync(NTP_WAIT_RETRY_DEFAULT);
+    serveTransmitPkt.current = (uint32_t)pvc.current;
+    serveTransmitPkt.panelVolt = pvc.panelVolt;
+    serveTransmitPkt.burnTime = storedDatas.lampBurnTime;
+    serveTransmitPkt.energyWh = storedDatas.energyWh;
+    serveTransmitPkt.pf = (uint8_t)(pvc.pf + 0.5f);
+    return serveTransmitPkt;
+
+  }
+void exampleMain( void )
+{
+  gReadyToSend = true;
+  gRxDataLength = 0;
+  uint8_t stacks[] = SF_STACK_LIST;
+  uint8_t batLowMode = true;
+  uint32_t burnTimeSaveCount = 0;
+  uint16_t batVolt;
+  uint32_t periodicCounter=0;
+  uint8_t nwkey[16] = {0x58, 0x48, 0x49, 0x80, 0x00, 0x00, 0xc4, 0xb5, 0x58, 0x48, 0x49, 0x80, 0x00, 0x00, 0xc4, 0xb5};
+  uint8_t profile = 0x04; // indian band.
+  uint32_t addressLow = HWREG(CCFG_BASE + CCFG_O_IEEE_MAC_1);
+  uint32_t addressHigh = HWREG(CCFG_BASE + CCFG_O_IEEE_MAC_0);
+  eui[0] = (addressLow >> 24) & 0xFF;
+  eui[1] = (addressLow >> 16) & 0xFF;
+  eui[2] = (addressLow >> 8) & 0xFF;
+  eui[3] = (addressLow >> 0) & 0xFF;
+  eui[4] = (addressHigh >> 24) & 0xFF;
+  eui[5] = (addressHigh >> 16) & 0xFF;
+  eui[6] = (addressHigh >> 8) & 0xFF;
+  eui[7] = (addressHigh >> 0) & 0xFF;
+  serveTransmitPkt_t serveTransmitPkt;
+  sf_app_hal_init( );
+  sf_memory_management_init( );
+
+  /* Initialize the stack API */
+  if( E_STACK_RETURN_SUCCESS != sf_stack_init( loc_callback ) )
+  {
+    sf_app_hal_system_errorHandler( );
+  }
+
+  /* Initialize application extensions, if possible */
+  if( E_STACK_RETURN_SUCCESS != sf_app_ex_init( ) )
+  {
+    sf_app_hal_system_errorHandler( );
+  }
+
+  /* Initializes the stacks with NVM data, if possible. */
+  sf_memory_management_readNvm( SF_STACK_NUMBER, stacks );
+  sf_stack_set(E_STACK_PARAM_ID_MIOTY_EUI64, & eui);
+  sf_stack_set(E_STACK_PARAM_ID_MIOTY_NWKKEY, & nwkey);
+  sf_stack_set(E_STACK_PARAM_ID_MIOTY_PROFILE, & profile);
+  ADC_init();
+  flash_init();
+  memoryHandle_firstBoot();
+  while( 1 )
+  {
+      //=======================batLowmode=================================================
+      if (batLowMode) {
+        batVolt = pvc_readBatVolt();
+        if (batVolt > (MIN_BAT_TH + BATVOLT_LOW_HYSTERESIS)) {
+            /* Recovered: back to normal cycle. The full pvc next cycle
+             * clears the fault and sends PKT_FAULT_CLEAR. */
+           // op_uart_printf("-1-mydemo:battery recovered batVolt=%u, normal mode\r\n", batVolt);
+            batLowMode = false;
+            /* Don't count the 2h sleep as lamp burn time */
+            burnTimeSaveCount = 0;
+            continue;
+        }
+       // op_uart_printf("-1-mydemo:battery low batVolt=%u, sleep 2h\r\n", batVolt);
+        if (true != sf_app_hal_timer_start(batteryLowSleepSec, loc_timerCallback)) {
+         sf_app_hal_system_errorHandler();
+        }
+        gReadyToSend = false;
+        loc_handleStackStates( );
+        continue;
+    }
+      //========================================================
+      if (true != sf_app_hal_timer_start(wakeUpTime, loc_timerCallback)) {
+              sf_app_hal_system_errorHandler();
+            }
+
+            /* Update counters before lampStatus() so a due live packet
+             * goes out in this cycle, not the next one. */
+            burnTimeSaveCount++;
+            periodicCounter++;
+            if(periodicCounter >= (storedDatas.periodicTime / wakeUpTime))
+            {
+            perodicStatus=true;
+            periodicCounter=0;
+            }
+            if (burnTimeSaveCount >= (BURNTIME_SAVE_CYCLES/wakeUpTime)) {
+                  burnTimeSaveCount = 0;
+                 // op_uart_printf("-1-mydemo:saving lampBurnTime=%lu\r\n", (unsigned long)storedDatas.lampBurnTime);
+                 memoryHandle_writeConfigStoreWithBackup();
+            }
+
+          serveTransmitPkt=lampStatus();
+          if(serveTransmitPkt.pktType==PKT_LIVE){
+		          perodicStatus=false;
+		      }
+          /* Start the periodic count from the boot packet, so the first
+           * live packet comes one full periodicTime after boot. */
+          if(serveTransmitPkt.pktType==PKT_BOOTON){
+              perodicStatus=false;
+              periodicCounter=0;
+              burnTimeSaveCount = 0;
+          }
+
+            loc_handleTransmission(serveTransmitPkt);
+            if (serveTransmitPkt.faultStatus & FAULT_BAT_BIT) {
+                //  op_uart_printf("-1-mydemo:battery low, saving lampBurnTime=%lu, entering 2h mode\r\n",(unsigned long)storedDatas.lampBurnTime);
+                  memoryHandle_writeConfigStoreWithBackup();
+                  batLowMode = true;
+
+              }
+            loc_handleStackStates( );
+  }
+}
+
+/*============================================================================*/
+/*!
+ * @brief  Main function.
+ */
+/*============================================================================*/
+#ifndef SF_USE_RTOS_APPLICATION
+int main( void )
+{
+  exampleMain( );
+  return 0;
+}
+#endif /* SF_USE_RTOS_APPLICATION */
+
+#ifdef __cplusplus
+}
+#endif

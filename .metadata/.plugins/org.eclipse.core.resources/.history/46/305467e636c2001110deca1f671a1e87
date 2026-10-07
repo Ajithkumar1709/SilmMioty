@@ -1,0 +1,204 @@
+#include <pvcMeasure/pvcMeasure.h>
+#include "math.h"
+  #include <syscfg/ti_drivers_config.h>
+  #include <ti/drivers/ADC.h>
+#include"memoryHandler/memoryHandle.h"
+  #include "unistd.h"
+#include<ti/display/Display.h>
+#define SAMPLE 5
+
+extern Display_Handle display1;
+
+  //===========================================ADC============================================
+  int_fast16_t res;
+  uint16_t adcValue0;
+  uint32_t adcValue0MicroVolt;
+  uint32_t getAdcVolatgeInMV(unsigned char adcIndex) {
+
+    // initialize optional ADC parameters
+
+    ADC_Params params;
+    ADC_Params_init( & params);
+    params.isProtected = true;
+
+    // Open ADC channels for usage
+    ADC_Handle adcForBattery = ADC_open(adcIndex, & params);
+    res = ADC_convert(adcForBattery, & adcValue0);
+
+    if (res == ADC_STATUS_SUCCESS) {
+      adcValue0MicroVolt = ADC_convertRawToMicroVolts(adcForBattery, adcValue0);
+    } else {
+      //Display_printf(display1, 0, 0, "CONFIG_ADC_0 convert failed\n");
+    }
+
+    ADC_close(adcForBattery);
+    return (adcValue0MicroVolt / 1000); //;
+  }
+
+  /*============================================================================*/
+
+extern char buffer[150];
+
+/* Battery voltage is a steady DC signal (unlike the AC current/voltage
+ * lines), so a plain 10-sample average is enough -- no RMS/min-max
+ * midpoint calc needed. Leaves pin 21 HIGH (battery/panel sense). */
+uint16_t pvc_readBatVolt(void)
+{
+    float batVoltRaw = 0;
+    uint16_t batVolt;
+    int i;
+
+
+    for (i = 0; i < 10; i++) {
+        batVoltRaw += getAdcVolatgeInMV(batterySenseAdcDIO29);//ol_adc_get_vol(mbtk_adc_index_2);
+        usleep(10);
+    }
+    batVoltRaw /= 10;
+    /* %f is avoided here since embedded printf implementations often don't
+     * support floating point specifiers without extra linker support -
+     * this codebase's other prints all stick to integer formats. */
+   Display_printf(display1, 0, 0,"pvc_measure: batVolt raw avg=%lu\r\n", (unsigned long)batVoltRaw);
+
+    /* Battery-sense divider on this hardware: VBAT -> R9(100k) -> tap -> R12(47k) -> GND.
+     * ol_adc_get_vol() already returns millivolts, so just scale back up by
+     * (R9+R12)/R12 = 147/47 to recover actual VBAT in mV -- no further unit
+     * conversion needed. */
+    batVolt = (uint16_t)(batVoltRaw * (147.0f / 47.0f));
+   Display_printf(display1, 0, 0,"pvc_measure: batVolt scaled=%u\r\n", batVolt);
+    return batVolt;
+}
+
+pvc_t pvc_measure(uint32_t elapsedMs)
+{
+
+    pvc_t pvc;
+    int i, cnt;
+    static uint32_t burnRemainderMs = 0; /* ms carried so partial seconds aren't lost */
+    static uint32_t energyRemainderWms = 0;
+    /* Now storing actual voltage readings, not raw ADC counts */
+    float Voltage_temp[80];
+    float current_temp[80];
+
+    float voltage_max, current_max, voltage_min, current_min;
+    float voltage_miDmv = 0, current_miDmA = 0;
+    float voltage_adcsample = 0, current_adcsample = 0;
+    float voltage_insta = 0, current_insta = 0;
+    float current = 0;
+    float voltage = 0, power = 0;
+    float powerAvg = 0;
+    float panelVoltRaw;
+
+    /* Pin 21 selects what the ADC sees: HIGH = battery sense,
+     * LOW = AC voltage/current sense. Short settle delay after each switch. */
+    pvc.batVolt = pvc_readBatVolt();
+
+    /* Panel (solar) voltage on ADC1 while pin 21 is still HIGH. Same DC
+     * 10-sample average as battery. Divider: V_SOL -> R10(470k) -> tap ->
+     * R14(82.5k) -> GND, so scale mV back up by (R10+R14)/R14 = 552.5/82.5. */
+    panelVoltRaw = 0;
+    for (i = 0; i < 10; i++) {
+        panelVoltRaw += getAdcVolatgeInMV(panelVolageAdcDIO28);//ol_adc_get_vol(mbtk_adc_index_1);
+        usleep(10);
+    }
+    panelVoltRaw /= 10;
+   Display_printf(display1, 0, 0,"pvc_measure: panelVolt raw avg=%lu\r\n", (unsigned long)panelVoltRaw);
+
+    pvc.panelVolt = (uint16_t)(panelVoltRaw * (552.5f / 82.5f));
+  //  op_uart_printf("pvc_measure: panelVolt scaled=%u\r\n", pvc.panelVolt);
+
+
+
+    for (cnt = 0; cnt < SAMPLE; cnt++) {
+     //   op_uart_printf("pvc_measure: 80-sample loop start cnt=%d\r\n", cnt);
+
+      //  tick_loop_start = ol_os_get_ticks();
+        for (i = 0; i < 80; i++) {
+            /* Voltage channel - direct voltage value, no raw->volt conversion needed */
+            Voltage_temp[i] =getAdcVolatgeInMV(volatgeAdcDIO24);//ol_adc_get_vol(mbtk_adc_index_2);
+          //  op_uart_printf("pvc_measure: raw voltage[%d]=%lu\r\n", i, (unsigned long)Voltage_temp[i]);
+
+            /* Current-sense channel - adjust index to whichever channel your
+               current sense line is wired to */
+            current_temp[i] = getAdcVolatgeInMV(currentAdcDIO23); //ol_adc_get_vol(mbtk_adc_index_1);
+          //  op_uart_printf("pvc_measure: raw current[%d]=%lu\r\n", i, (unsigned long)current_temp[i]);
+
+            usleep(80);
+        }
+
+
+       Display_printf(display1, 0, 0,"pvc_measure: 80-sample loop end cnt=%d elapsed=%ums\r\n",cnt, (tick_loop_end - tick_loop_start) * 5);
+
+        /* Find max/min for this batch of 80 samples */
+        voltage_max = current_max = 0;
+        voltage_min = current_min = 999999.0f; /* large sentinel instead of RESOLUTION */
+        for (i = 0; i < 80; i++) {
+            voltage_max = (Voltage_temp[i] > voltage_max) ? Voltage_temp[i] : voltage_max;
+            voltage_min = (Voltage_temp[i] < voltage_min) ? Voltage_temp[i] : voltage_min;
+            current_max = (current_temp[i] > current_max) ? current_temp[i] : current_max;
+            current_min = (current_temp[i] < current_min) ? current_temp[i] : current_min;
+        }
+      //  op_uart_printf("pvc_measure: cnt=%d voltage max=%ldmV min=%ldmV | current max=%ldmV min=%ldmV\r\n", cnt, (long)voltage_max, (long)voltage_min, (long)current_max, (long)current_min);
+
+        /* ol_adc_get_vol() returns raw millivolts; convert to volts here the
+         * same way the original Nuvoton code converted raw ADC counts to
+         * volts (raw * REF_VOLT / RESOLUTION) before applying the sensor
+         * calibration constants below unchanged. */
+        voltage_miDmv = ((voltage_max + voltage_min) / 2.0f) / 1000.0f;
+        current_miDmA = ((current_max + current_min) / 2.0f) / 1000.0f;
+        /* printed in mV (x1000) since %f isn't supported */
+      //  op_uart_printf("pvc_measure: cnt=%d voltage_miDmv=%ldmV current_miDmA=%ldmV\r\n",cnt, (long)(voltage_miDmv * 1000.0f), (long)(current_miDmA * 1000.0f));
+
+        voltage_adcsample = voltage_insta = current_adcsample = current_insta = power = 0;
+        for (i = 0; i < 80; i++) {
+            voltage_insta = (Voltage_temp[i] / 1000.0f) - voltage_miDmv;
+            voltage_adcsample += voltage_insta * voltage_insta;
+
+            current_insta = (current_temp[i] / 1000.0f) - current_miDmA;
+            current_adcsample += current_insta * current_insta;
+
+            power += (((current_insta / 1.0f) * 1000.0f) / 68.0f) *
+                     ((voltage_insta * 440000.0f) /330.0f);
+        }
+        powerAvg += (power / 80);
+
+        voltage += (sqrt(voltage_adcsample / 80) * 440000.0f) / 330.0f;
+        current += (((sqrt(current_adcsample / 80)) / 1.0f) * 1000.0f) / 68.0f;
+    }
+
+  // Display_printf(display1, 0, 0,"pvc_measure: avg 80-sample loop elapsed=%ums (tick, target=25ms)\r\n",(tick_sum / SAMPLE) * 5);
+
+    pvc.voltage = voltage / SAMPLE;
+    pvc.current = (current / SAMPLE)*1000; /* convert to mA for storage in struct */
+    powerAvg = powerAvg / SAMPLE;
+    pvc.power = (powerAvg < 0) ? (powerAvg * -1.0f) : powerAvg;
+    pvc.power = (pvc.power < 2) ? 0 : pvc.power;
+
+    /* Power factor = real power (W) / apparent power (Vrms * Irms, VA).
+     * Use current in A (before the mA conversion above). No load -> 0. */
+    
+        float apparent = pvc.voltage * (current / SAMPLE);
+
+        pvc.pf = (pvc.power > 0 && apparent > 1.0f) ? (pvc.power / apparent) * 100.0f : 0;
+        pvc.pf = (pvc.pf > 100.0f) ? 100.0f : pvc.pf; /* sampling error can exceed 100 */
+    
+   Display_printf(display1, 0, 0,"pvc_measure: pf=%ld\r\n", (long)pvc.pf);
+
+    /* Lamp burn time (rbt): add the elapsed cycle time while the lamp is ON. */
+   if (pvc.power > storedDatas.Minpower) {
+        burnRemainderMs += elapsedMs;
+        storedDatas.lampBurnTime += burnRemainderMs / 1000;
+        burnRemainderMs %= 1000;
+    }
+    Display_printf(display1, 0, 0,"pvc_measure: elapsed=%lums lampBurnTime=%lu\r\n",(unsigned long)elapsedMs, (unsigned long)storedDatas.lampBurnTime);
+
+    /* Energy (wh): power (W) x elapsed time. 1 Wh = 3,600,000 W*ms; the
+     * remainder is carried so small per-cycle amounts aren't lost. */
+    if (pvc.power > 5) {
+        energyRemainderWms += (uint32_t)(pvc.power * (float)elapsedMs);
+        storedDatas.energyWh += energyRemainderWms / 3600000UL;
+        energyRemainderWms %= 3600000UL;
+    }
+   Display_printf(display1, 0, 0,"pvc_measure: energyWh=%lu\r\n", (unsigned long)storedDatas.energyWh);
+
+    return pvc;
+}

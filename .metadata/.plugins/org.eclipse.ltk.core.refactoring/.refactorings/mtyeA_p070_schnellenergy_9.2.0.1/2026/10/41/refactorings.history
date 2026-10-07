@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Rename resource &apos;mtyeA_p070_schnellenergy_9.2.0.1/apps/pvcMeaure&apos; to &apos;pvcMeasure&apos;" description="Rename resource &apos;pvcMeaure&apos;" flags="7" id="org.eclipse.ltk.core.refactoring.rename.resource" input="apps/pvcMeaure" name="pvcMeasure" stamp="1791290046058" updateReferences="true"/>
+</session>

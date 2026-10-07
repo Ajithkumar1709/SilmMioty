@@ -1,0 +1,6 @@
+# CCS embedded browser profile (cookies / login sessions) - not project data
+.jxbrowser.userdata/
+
+# CCS workspace lock and log files
+.metadata/.lock
+.metadata/*.log
